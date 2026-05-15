@@ -22,6 +22,129 @@
 
 #include "spdk/log.h"
 
+/*
+ * Compression latency simulation.
+ *
+ * Adds a memcpy (and optional busywait) around the NVMe-oF read/write path to
+ * mimic the CPU/latency cost of an inline compress/decompress step.
+ *   - memcpy is sized to the payload (per iov); simulates CPU bound work.
+ *   - busywait microseconds come from env vars read once per reactor thread:
+ *       SPDK_SIM_COMPRESS_WRITE_US  added on each write before submit
+ *       SPDK_SIM_COMPRESS_READ_US   added on each read after completion
+ * Set the macro to 0 (or build with -DSPDK_SIM_COMPRESS=0) to disable.
+ */
+#ifndef SPDK_SIM_COMPRESS
+#define SPDK_SIM_COMPRESS 1
+#endif
+
+#if SPDK_SIM_COMPRESS
+
+#include "spdk/env.h"
+
+#define SPDK_SIM_COMPRESS_SCRATCH (128 * 1024)
+
+struct sim_compress_state {
+	bool		inited;
+	uint64_t	write_busy_tsc;
+	uint64_t	read_busy_tsc;
+	void		*scratch;
+};
+
+static __thread struct sim_compress_state g_sim_compress;
+
+static void
+sim_compress_init_once(void)
+{
+	const char *env;
+	uint64_t hz, us;
+
+	if (spdk_likely(g_sim_compress.inited)) {
+		return;
+	}
+	g_sim_compress.inited = true;
+
+	hz = spdk_get_ticks_hz();
+
+	env = getenv("SPDK_SIM_COMPRESS_WRITE_US");
+	us = env ? strtoull(env, NULL, 10) : 0;
+	g_sim_compress.write_busy_tsc = (hz * us) / 1000000ULL;
+
+	env = getenv("SPDK_SIM_COMPRESS_READ_US");
+	us = env ? strtoull(env, NULL, 10) : 0;
+	g_sim_compress.read_busy_tsc = (hz * us) / 1000000ULL;
+
+	g_sim_compress.scratch = spdk_zmalloc(SPDK_SIM_COMPRESS_SCRATCH, 0x1000,
+					      NULL, SPDK_ENV_SOCKET_ID_ANY,
+					      SPDK_MALLOC_DMA);
+	if (g_sim_compress.scratch == NULL) {
+		SPDK_WARNLOG("sim_compress: scratch alloc failed; memcpy disabled\n");
+	}
+	SPDK_NOTICELOG("sim_compress: enabled write_us=%" PRIu64 " read_us=%" PRIu64 "\n",
+		       g_sim_compress.write_busy_tsc * 1000000ULL / hz,
+		       g_sim_compress.read_busy_tsc * 1000000ULL / hz);
+}
+
+static inline void
+sim_compress_memcpy_iov(struct iovec *iov, int iovcnt)
+{
+	int i;
+	size_t n, left;
+	const char *src;
+
+	if (g_sim_compress.scratch == NULL) {
+		return;
+	}
+	for (i = 0; i < iovcnt; i++) {
+		src = iov[i].iov_base;
+		left = iov[i].iov_len;
+		while (left) {
+			n = spdk_min(left, (size_t)SPDK_SIM_COMPRESS_SCRATCH);
+			memcpy(g_sim_compress.scratch, src, n);
+			src += n;
+			left -= n;
+		}
+	}
+}
+
+static inline void
+sim_compress_busywait(uint64_t busy_tsc)
+{
+	uint64_t start;
+
+	if (busy_tsc == 0) {
+		return;
+	}
+	start = spdk_get_ticks();
+	while ((spdk_get_ticks() - start) < busy_tsc) {
+		/* spin — blocks the reactor, that is the point */
+	}
+}
+
+static inline void
+sim_compress_apply_write(struct spdk_nvmf_request *req)
+{
+	sim_compress_init_once();
+	sim_compress_memcpy_iov(req->iov, req->iovcnt);
+	sim_compress_busywait(g_sim_compress.write_busy_tsc);
+}
+
+static void nvmf_bdev_ctrlr_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
+		void *cb_arg);
+
+static void
+sim_decompress_complete_cmd(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_nvmf_request *req = cb_arg;
+
+	if (spdk_likely(success)) {
+		sim_compress_memcpy_iov(req->iov, req->iovcnt);
+		sim_compress_busywait(g_sim_compress.read_busy_tsc);
+	}
+	nvmf_bdev_ctrlr_complete_cmd(bdev_io, success, req);
+}
+
+#endif /* SPDK_SIM_COMPRESS */
+
 static bool
 nvmf_subsystem_bdev_io_type_supported(struct spdk_nvmf_subsystem *subsystem,
 				      enum spdk_bdev_io_type io_type)
@@ -297,8 +420,14 @@ nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	assert(!spdk_nvmf_request_using_zcopy(req));
 
+#if SPDK_SIM_COMPRESS
+	sim_compress_init_once();
+	rc = spdk_bdev_readv_blocks(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
+				    sim_decompress_complete_cmd, req);
+#else
 	rc = spdk_bdev_readv_blocks(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 				    nvmf_bdev_ctrlr_complete_cmd, req);
+#endif
 	if (spdk_unlikely(rc)) {
 		if (rc == -ENOMEM) {
 			nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_ctrlr_process_io_cmd_resubmit, req);
@@ -342,6 +471,10 @@ nvmf_bdev_ctrlr_write_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 	}
 
 	assert(!spdk_nvmf_request_using_zcopy(req));
+
+#if SPDK_SIM_COMPRESS
+	sim_compress_apply_write(req);
+#endif
 
 	rc = spdk_bdev_writev_blocks(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 				     nvmf_bdev_ctrlr_complete_cmd, req);

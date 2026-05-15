@@ -214,6 +214,13 @@ DEFINE_STUB(spdk_bdev_copy_blocks, int,
 
 DEFINE_STUB(spdk_bdev_get_max_copy, uint32_t, (const struct spdk_bdev *bdev), 0);
 
+/* Stubs for compression-latency simulation (SPDK_SIM_COMPRESS). */
+DEFINE_STUB(spdk_get_ticks, uint64_t, (void), 0);
+DEFINE_STUB(spdk_get_ticks_hz, uint64_t, (void), 1000000000ULL);
+DEFINE_STUB(spdk_zmalloc, void *,
+	    (size_t size, size_t align, uint64_t *unused, int socket_id, uint32_t flags),
+	    NULL);
+
 struct spdk_nvmf_ns *
 spdk_nvmf_subsystem_get_ns(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid)
 {
