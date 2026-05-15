@@ -13,12 +13,17 @@
 #   - nvme-cli, fio
 #   - built SPDK with this branch's patch
 #
-# Usage:  sim_compress_verify.sh "<label>" [write_us] [read_us]
+# Usage:  sim_compress_verify.sh "<label>" [comp_w_us] [comp_r_us] [crc_w_us] [crc_r_us]
+#   comp_w_us / comp_r_us — busywait microseconds for the compression stage
+#   crc_w_us  / crc_r_us  — busywait microseconds for the CRC stage
+# memcpy always runs (one pass per stage when compiled with SPDK_SIM_COMPRESS=1).
 set -eu
 
 LABEL="${1:-baseline}"
-WRITE_US="${2:-0}"
-READ_US="${3:-0}"
+COMP_W_US="${2:-0}"
+COMP_R_US="${3:-0}"
+CRC_W_US="${4:-0}"
+CRC_R_US="${5:-0}"
 
 # Resolve SPDK root from script location (scripts/ is sibling of build/).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,10 +81,12 @@ else
 fi
 # ----------------------------------------------------------------------------
 
-export SPDK_SIM_COMPRESS_WRITE_US="$WRITE_US"
-export SPDK_SIM_COMPRESS_READ_US="$READ_US"
+export SPDK_SIM_COMPRESS_WRITE_US="$COMP_W_US"
+export SPDK_SIM_COMPRESS_READ_US="$COMP_R_US"
+export SPDK_SIM_CRC_WRITE_US="$CRC_W_US"
+export SPDK_SIM_CRC_READ_US="$CRC_R_US"
 
-echo "==> [$LABEL] starting nvmf_tgt (WRITE_US=$WRITE_US READ_US=$READ_US)"
+echo "==> [$LABEL] starting nvmf_tgt (comp=${COMP_W_US}/${COMP_R_US} crc=${CRC_W_US}/${CRC_R_US} µs)"
 # shellcheck disable=SC2086
 if [ -n "$EAL_EXTRA" ]; then
     EAL_CTX="${EAL_EXTRA#--env-context=}"
