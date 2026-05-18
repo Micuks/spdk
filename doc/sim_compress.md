@@ -4,52 +4,60 @@
 
 ## 这是什么
 
-在 SPDK NVMe-oF target 的 bdev 读写路径上注入两段动作，模拟 CRC 计算和
-压缩/解压的 CPU 开销，无需引入真实的 ISA-L 或 DPDK_compressdev：
-
-- **memcpy** 整段 payload，模拟数据扫描的 CPU bandwidth 消耗
-- **busywait** 一段微秒数，模拟卸载到加速器/加密引擎的固定延时
+在 SPDK NVMe-oF target 的 bdev 读写路径上，运行一段**时间受限的 memcpy
+循环**，模拟 CRC 计算和压缩/解压的 CPU + 内存带宽开销，无需引入真实的
+ISA-L 或 DPDK_compressdev。
 
 每个阶段（CRC、Compress）独立可调。流水线顺序匹配实际存储路径：
 
 ```
-write_cmd:  CRC scan + busywait  →  compress scan + busywait  →  bdev submit
-read_cmd:   bdev complete  →  decompress scan + busywait  →  CRC validate + busywait
+write_cmd:  CRC memcpy-for-us  →  compress memcpy-for-us  →  bdev submit
+read_cmd:   bdev complete  →  decompress memcpy-for-us  →  CRC validate memcpy-for-us
 ```
+
+仿真的关键性质：**memcpy 在 per-thread scratch 上用移动指针走，每次循环
+都打到新的 cache line / DRAM 行**。scratch 默认 4 MiB（大于典型 L2），所以
+循环会真正消耗 L3 / 内存带宽，把 IOSTASH 写进 L3 的内容冲掉 —— 这正是
+要测的开启 CRC/压缩后内存子系统压力。
 
 ## 旋钮
 
-四个环境变量，nvmf_tgt 启动时读一次，之后不变：
+五个环境变量，nvmf_tgt 启动时读一次，之后不变：
 
-| 变量 | 含义 |
-|---|---|
-| `SPDK_SIM_COMPRESS_WRITE_US` | 写路径压缩 busywait 微秒数 |
-| `SPDK_SIM_COMPRESS_READ_US`  | 读路径解压 busywait 微秒数 |
-| `SPDK_SIM_CRC_WRITE_US`      | 写路径 CRC busywait 微秒数 |
-| `SPDK_SIM_CRC_READ_US`       | 读路径 CRC 校验 busywait 微秒数 |
+| 变量 | 含义 | 默认 |
+|---|---|---|
+| `SPDK_SIM_COMPRESS_WRITE_US` | 写路径压缩 memcpy 目标耗时（µs） | `0` |
+| `SPDK_SIM_COMPRESS_READ_US`  | 读路径解压 memcpy 目标耗时（µs） | `0` |
+| `SPDK_SIM_CRC_WRITE_US`      | 写路径 CRC memcpy 目标耗时（µs） | `0` |
+| `SPDK_SIM_CRC_READ_US`       | 读路径 CRC 校验 memcpy 目标耗时（µs） | `0` |
+| `SPDK_SIM_SCRATCH_KB`        | per-thread scratch 大小（KiB） | `4096` |
 
-默认 0 即"该阶段只有 memcpy，不加固定延时"。memcpy 始终运行（编译期开关
-ON 时），所以即使全 0 也会有两次 memcpy（CRC 一次 + Compress 一次）的
-CPU 开销。
+全 0 = 不做任何 memcpy（`target_tsc == 0` 直接 return）。
+
+scratch 默认 4 MiB 够冲掉典型 L2。要冲掉 LLC（典型 32–64 MiB）建议设到
+`65536`（64 MiB）：
+
+```bash
+export SPDK_SIM_SCRATCH_KB=65536
+```
 
 编译期开关：`lib/nvmf/ctrlr_bdev.c` 顶部 `#define SPDK_SIM_COMPRESS 1`。
 关掉传 `-DSPDK_SIM_COMPRESS=0` 给 make，整段仿真代码不编入二进制。
 
-nvmf_tgt 启动时会打一行 NOTICELOG，确认四个值的当前生效：
+nvmf_tgt 启动时会打一行 NOTICELOG，确认五个值的当前生效：
 
 ```
-[...] sim_compress: enabled compress_w_us=200 compress_r_us=200 crc_w_us=50 crc_r_us=50
+[...] sim_compress: enabled scratch=4096 KiB compress_w_us=200 compress_r_us=200 crc_w_us=50 crc_r_us=50
 ```
 
 ---
 
-## 在物理 Linux 上从零到出图
+# Server 端
 
-下面以 aarch64 或 x86_64 物理机为目标，使用 RDMA transport + 物理 NVMe SSD
-+ SPDK perf 当 initiator（C1/C2 标准 SOP 形状）。OrbStack / 无 RDMA / 无
-物理 NVMe 的环境见附录 A。
+下面以物理 Linux + RDMA NIC + 物理 NVMe SSD 为目标。OrbStack / 无 RDMA /
+无物理 NVMe 见附录 A。
 
-### 1. 拉代码 + 装依赖
+## 1. 拉代码 + 装依赖
 
 ```bash
 git clone https://github.com/Micuks/spdk.git
@@ -59,7 +67,7 @@ git submodule update --init
 ./scripts/pkgdep.sh
 ```
 
-### 2. 编译
+## 2. 编译
 
 ```bash
 ./configure --with-rdma
@@ -67,40 +75,56 @@ make -j$(nproc)
 make install
 ```
 
-### 3. 配 hugepage + 绑 NVMe 到 vfio/uio
+## 3. 配 hugepage + 绑 NVMe 到 vfio/uio
 
 ```bash
 echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 mkdir -p /dev/hugepages
 mount -t hugetlbfs nodev /dev/hugepages
+cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages   # 确认
 
-# 把你要测的 NVMe 盘 BDF 列出来（lsscsi / lspci 查）
+# 列出要测的 NVMe BDF
+lsscsi | grep HWE72P
+./scripts/setup.sh status
+
+# 绑到 vfio/uio
 PCI_ALLOWED="0000:d6:00.0 0000:d9:00.0 0000:57:00.0" ./scripts/setup.sh
 ```
 
-### 4. 配 RDMA 网络
+## 4. 配 RDMA 网络
 
 ```bash
 nmcli connection add type ethernet con-name enp23s0f0np0 ifname enp23s0f0np0
+nmcli connection add type ethernet con-name enp23s0f1np1 ifname enp23s0f1np1
 nmcli connection modify enp23s0f0np0 ipv4.addresses 192.168.65.81/24 \
     ipv4.gateway 192.168.65.1 ipv4.method manual
+nmcli connection modify enp23s0f1np1 ipv4.addresses 192.168.75.81/24 \
+    ipv4.gateway 192.168.75.1 ipv4.method manual
 nmcli connection up enp23s0f0np0
-# 第二口同理
+nmcli connection up enp23s0f1np1
 ```
 
-### 5. 起 target（带 sim 环境变量）
+## 5. 选 combo，设环境变量，起 target
 
 ```bash
-# 选一组 combo
+# baseline 不加任何 sim
+unset SPDK_SIM_COMPRESS_WRITE_US SPDK_SIM_COMPRESS_READ_US \
+      SPDK_SIM_CRC_WRITE_US     SPDK_SIM_CRC_READ_US
+
+# 或者：CRC + 压缩都开
 export SPDK_SIM_COMPRESS_WRITE_US=200
 export SPDK_SIM_COMPRESS_READ_US=200
 export SPDK_SIM_CRC_WRITE_US=50
 export SPDK_SIM_CRC_READ_US=50
 
+# 起 target
 ./build/bin/nvmf_tgt -m 0x30 &
 ```
 
-### 6. 配置 transport / bdev / subsystem / listener
+`SPDK_SIM_*_US` 是 reactor 线程**第一次进 I/O** 时读取并缓存的。运行中改
+环境变量不会重新生效，**必须 kill nvmf_tgt 后重起**。
+
+## 6. 配 transport / bdev / subsystem / listener
 
 ```bash
 ./scripts/rpc.py nvmf_create_transport -t RDMA \
@@ -110,6 +134,9 @@ export SPDK_SIM_CRC_READ_US=50
 ./scripts/rpc.py bdev_nvme_attach_controller -b nvme6 -t PCIe -a 0000:d9:00.0
 ./scripts/rpc.py bdev_nvme_attach_controller -b nvme0 -t PCIe -a 0000:57:00.0
 
+# 检查子系统是否已存在
+./scripts/rpc.py nvmf_get_subsystems
+# 不存在则创建
 ./scripts/rpc.py nvmf_create_subsystem nqn.2016-06.io.spdk:cnode1 \
     -a -s SPDK00000000000001 -m 8
 
@@ -123,66 +150,89 @@ export SPDK_SIM_CRC_READ_US=50
     -t RDMA -a 192.168.75.81 -s 4420
 ```
 
-### 7. Client 端测试
-
-在另一台机器（C1 或 C2，根据测什么）上：
+## 7. 切换 combo
 
 ```bash
+pkill -9 -f build/bin/nvmf_tgt
+sleep 1
+
+# 改 env var
+export SPDK_SIM_COMPRESS_WRITE_US=...
+export SPDK_SIM_COMPRESS_READ_US=...
+export SPDK_SIM_CRC_WRITE_US=...
+export SPDK_SIM_CRC_READ_US=...
+
+# 重起 + 重做第 6 步的 RPC 配置
+./build/bin/nvmf_tgt -m 0x30 &
+# ... rpc.py 命令
+```
+
+---
+
+# Client 端
+
+Client 跑 SPDK 自带 perf 当 initiator，指向 server 的某个 listener IP：
+
+```bash
+# 写
 ./build/examples/perf \
     -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.81 trsvcid:4420' \
     -t 30 -w write -o 4096 -q 1
 
+# 读
 ./build/examples/perf \
     -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.81 trsvcid:4420' \
     -t 30 -w read -o 4096 -q 1
 ```
 
-记录每次跑出来的 IOPS + 平均延时。
+`traddr` 填的是 server 的 listener IP（第 4 步 nmcli 配的那两个 IP 之一）。
 
-### 8. 切换 combo
+记录 perf 输出末尾 `Total` 行的 IOPS + Average latency。
 
-`kill` 掉 nvmf_tgt，改 `export`，重起。`SPDK_SIM_*_US` 是 reactor 线程
-第一次进 I/O 时读取并缓存的，运行中改环境变量不会重新生效。
+## 四个推荐 combo
 
-四个推荐 combo：
+每个 combo = server 重起一次（带不同 env var）+ client 跑一对 read/write：
 
-| label | COMPRESS_WRITE/READ | CRC_WRITE/READ | 含义 |
+| label | SPDK_SIM_COMPRESS_WRITE/READ_US | SPDK_SIM_CRC_WRITE/READ_US | 含义 |
 |---|---|---|---|
-| baseline | 0 / 0 | 0 / 0 | 只有 memcpy 开销，无固定延时 |
-| crc      | 0 / 0 | 50 / 50 | 单独看 CRC 的代价 |
-| comp     | 200 / 200 | 0 / 0 | 单独看压缩的代价 |
+| baseline | 0 / 0 | 0 / 0 | 干净路径，IOSTASH 仍生效 |
+| crc      | 0 / 0 | 50 / 50 | 仅 CRC 路径上的 memcpy + 内存带宽消耗 |
+| comp     | 200 / 200 | 0 / 0 | 仅压缩路径 |
 | both     | 200 / 200 | 50 / 50 | 实际部署形态 |
 
-50 µs 和 200 µs 是占位数，实际值按你的硬件目标延时调（典型软件 CRC32 ~20-50 µs
-per 4 KiB，软件 zstd-fast ~100-300 µs per 4 KiB）。
+50 µs 和 200 µs 是占位数。实际值按你的目标硬件（或目标加速卡）延时调，
+典型软件 CRC32 per 4 KiB ≈ 20–50 µs，软件 zstd-fast per 4 KiB ≈
+100–300 µs。
 
 ---
 
-## 自动化 4-combo 扫描
+# 自动化：`scripts/bench_sim_compress.sh`
 
-仓库自带 `scripts/bench_sim_compress.sh`，按 SOP 形状把上面第 5–8 步串起来：
+把上面 server + client 步骤封进一个脚本，方便循环 4 个 combo。
+
+## 子命令
 
 ```bash
 # Server 端
 sudo bash scripts/bench_sim_compress.sh setup baseline 0 0 0 0
-# Client 端
+# Client 端（也可以是同一台机器）
 sudo bash scripts/bench_sim_compress.sh probe baseline <server_ip>
 # Server 端
 sudo bash scripts/bench_sim_compress.sh teardown
 ```
 
-四个 combo + 总结表一行：
+四个 combo 一键扫，单机本地（server=client 同台）跑：
 
 ```bash
 sudo bash scripts/bench_sim_compress.sh all <target_ip>
 ```
 
-`all` 顺序跑 baseline / crc / comp / both，每个 combo 完整做 setup → probe →
-teardown，最后打印一张总结表。结果原始 log 在 `/tmp/sim_compress_bench/`。
+`all` 顺序跑 baseline → crc → comp → both，每个 combo 完整做 setup → probe
+→ teardown，最后打总结表。结果原始 log 在 `/tmp/sim_compress_bench/`。
 
-### Machine config
+## Machine config
 
-脚本顶部 `MACHINE CONFIG` 一段集中放可调项。物理机默认值（PRESET=prod）：
+脚本顶部 `MACHINE CONFIG` 一段集中放可调项。物理机默认（`PRESET=prod`）：
 
 ```bash
 TRANSPORT=RDMA
@@ -193,7 +243,7 @@ INITIATOR=spdk_perf
 PERF_TIME=30 PERF_BS=4096 PERF_QD=1
 ```
 
-按你机器实际情况改这一段。所有变量都可以用 env var 覆盖，不用改源文件：
+按你机器实际情况改这一段，或者用 env var 覆盖，不动源文件：
 
 ```bash
 NVME_BDFS="0000:af:00.0" LISTEN_IPS="10.0.0.1" \
@@ -202,7 +252,7 @@ NVME_BDFS="0000:af:00.0" LISTEN_IPS="10.0.0.1" \
 
 ---
 
-## 排错速查
+# 排错速查
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -211,21 +261,23 @@ NVME_BDFS="0000:af:00.0" LISTEN_IPS="10.0.0.1" \
 | `bdev_nvme_attach_controller` 报 device busy | NVMe 还在内核驱动上 | 先跑 `PCI_ALLOWED=... ./scripts/setup.sh` 绑到 vfio/uio |
 | 没有 `sim_compress: enabled` 日志 | 编译期没带 patch | 检查 `lib/nvmf/ctrlr_bdev.c` 顶部 `SPDK_SIM_COMPRESS=1`，重新 `make` |
 | 改了 `SPDK_SIM_*_US` 延时不变 | env var 没透传，或 nvmf_tgt 没重启 | env var 必须 `export` 后再启 nvmf_tgt；运行中改无效，要重启 |
-| perf 报 `Failed to initialize DPDK` | initiator 那边也要 hugepage | 在 client 主机上同样 `echo 1024 > .../nr_hugepages` |
+| client perf 报 `Failed to initialize DPDK` | initiator 那边也要 hugepage | client 主机上同样 `echo 1024 > .../nr_hugepages` |
+| 同样 us 配置在两台机器上延时差很多 | 这是设计上的预期 —— memcpy 吞吐受 DDR 代数 / NUMA / hugepage / CPU 频率影响 | 跨机比较时报 **combo - baseline 的 delta**，不报绝对值 |
 
 ---
 
-## 实现要点
+# 实现要点
 
-- **scratch 缓冲**：每个 reactor 线程通过 `spdk_zmalloc` 分配 128 KiB DMA
-  内存。memcpy 时把 `req->iov[]` 顺序拷进 scratch（超过 128 KiB 的 I/O
-  分段循环重用）。`req->iov` 原数据**不动**，提交到底层 bdev 的依然是
-  原指针，仅多消耗一次内存带宽。
-- **busywait 阻塞 reactor**：用 `spdk_get_ticks` 自旋。SPDK 是单 reactor
-  线程模型，仿真"CPU 占用"必须阻塞其它待处理 I/O；要做异步等价物得换
-  `spdk_poller_register` + timeout 回调。
-- **每阶段独立 memcpy**：CRC 一次 + Compress 一次，模拟两次数据扫描。
-  合并成一次会低估内存带宽压力。
+- **memcpy-for-us 循环**：`sim_compress_memcpy_for_us(iov, iovcnt, target_tsc)`
+  在 scratch 上用**移动指针**重复拷贝 payload，直到 `spdk_get_ticks() -
+  start >= target_tsc`。每次循环写到 scratch 的不同偏移，避免每次都打到
+  同一条 L1/L2 cache line。
+- **Scratch 大小**：默认 4 MiB（`SPDK_SIM_SCRATCH_KB=4096`），大于任何
+  现代 CPU 单核 L2。要超过 LLC 强制 DRAM 流量，设到 `65536` (64 MiB)。
+  per-reactor-thread 各自一块，`spdk_zmalloc` 分配 DMA-able 内存。
+- **每阶段独立循环**：CRC 一次 + Compress 一次，模拟两次独立数据扫描。
+- **不修改 payload**：scratch 是写入目标，`req->iov` 原数据不动，提交到
+  底层 bdev 的依然是原指针。
 - **只挂 bdev 路径**：admin cmd、zcopy、compare-and-write、fused 等不动。
   zcopy 走 `nvmf_bdev_ctrlr_zcopy_start` 路径，本补丁不触发。
 
@@ -239,38 +291,43 @@ NVME_BDFS="0000:af:00.0" LISTEN_IPS="10.0.0.1" \
 
 ---
 
-## 附录 A：OrbStack / 无 RDMA / 无物理 NVMe 环境
+# 附录 A：OrbStack / 无 RDMA / 无物理 NVMe
 
 在 macOS OrbStack Ubuntu VM、或任何没 RDMA NIC + 没物理 NVMe 的 Linux 上，
 用 `PRESET=orbstack` 切到 TCP + malloc bdev + 内核 nvme-tcp + fio：
 
 ```bash
-# 容器/VM 共享内核没 hugepage 时，脚本自动用 DPDK --no-huge --legacy-mem
-# devtmpfs 不响应内核 hotplug 时，脚本从 /sys/class/block 读 major:minor mknod
-
 sudo modprobe nvme-tcp
 sudo apt-get install -y nvme-cli fio
 
 PRESET=orbstack sudo bash scripts/bench_sim_compress.sh all 127.0.0.1
 ```
 
-输出格式同物理机路径，方便方法学和代码改动验证。**这里跑出来的绝对数值代
-表不了任何 RDMA + 物理 NVMe 主机的真实性能** —— 用来确认补丁逻辑、延时
-增量、脚本路径，不用来对比 AMD vs Intel。
+脚本会自动：
 
-### A.1 OrbStack aarch64 上的实测数
+- 容器/VM 共享内核没 hugepage 时切到 DPDK `--no-huge --legacy-mem`
+- devtmpfs 不响应内核 hotplug 时从 `/sys/class/block` 读 major:minor mknod
 
-`PERF_TIME=15 PRESET=orbstack`，4K block size，QD=1，TCP loopback，malloc bdev：
+输出格式同物理机路径。**这里跑出来的绝对数值代表不了任何 RDMA + 物理 NVMe
+主机的真实性能** —— 用来确认补丁逻辑、scratch 在动、延时增量大致符合
+配置，不用来对比不同 x86 平台。
 
-| Combo | comp w/r | crc w/r | RW | IOPS | AvgLat |
-|---|---|---|---|---|---|
-| baseline | 0/0 | 0/0 | write | 25.7k | 37.93 µs |
-| baseline | 0/0 | 0/0 | read  | 21.2k | 46.09 µs |
-| crc | 0/0 | 50/50 | write | 10.5k | 94.19 µs |
-| crc | 0/0 | 50/50 | read  | 10.6k | 93.07 µs |
-| comp | 200/200 | 0/0 | write | 3.8k  | 259.10 µs |
-| comp | 200/200 | 0/0 | read  | 3.3k  | 304.70 µs |
-| both | 200/200 | 50/50 | write | 3.2k  | 312.23 µs |
-| both | 200/200 | 50/50 | read  | 3.3k  | 300.28 µs |
+## A.1 OrbStack aarch64 实测
 
-延时增量与配置 us 数吻合 ±15%。
+`PERF_TIME=30 PRESET=orbstack PERF_BS=4096 PERF_QD=1`，TCP loopback，
+3×malloc bdev：
+
+| Combo | comp w/r | crc w/r | RW | IOPS | AvgLat | delta |
+|---|---|---|---|---|---|---|
+| baseline | 0/0 | 0/0 | write | 24.4k | 39.78 µs | — |
+| baseline | 0/0 | 0/0 | read  | 23.9k | 40.71 µs | — |
+| crc      | 0/0 | 50/50 | write | 9560 | 103.15 µs | +63 |
+| crc      | 0/0 | 50/50 | read  | 9988 | 98.81 µs | +58 |
+| comp     | 200/200 | 0/0 | write | 3827 | 259.67 µs | +220 |
+| comp     | 200/200 | 0/0 | read  | 3702 | 268.52 µs | +228 |
+| both     | 200/200 | 50/50 | write | 3002 | 331.39 µs | +292 |
+| both     | 200/200 | 50/50 | read  | 2950 | 337.42 µs | +297 |
+
+延时增量与配置 us 吻合 ±15%。OrbStack VM 共享 macOS 内核，无 DDIO / IOSTASH，
+所以这里 memcpy-loop 跟 busywait 总延时看着差不多 —— 真正的差异要在物理
+机上跑出来才能看到（L3 cache 行为、内存带宽消耗、AMD vs Intel 子系统差异）。
