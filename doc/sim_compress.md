@@ -252,6 +252,130 @@ NVME_BDFS="0000:af:00.0" LISTEN_IPS="10.0.0.1" \
 
 ---
 
+# 带宽统计
+
+每次 `probe` 跑 fio/perf 时，脚本会同时采集三类带宽计数器，输出到
+`/tmp/sim_compress_bench/measure-<combo>-<rw>.log`，并汇总进总结表的新列。
+
+| 列 | 含义 | 数据源 |
+|---|---|---|
+| `TxBW(MB)` / `RxBW(MB)` | per-second 网络带宽 (MB/s) | RDMA: `/sys/class/infiniband/<dev>/ports/<port>/counters/port_{xmit,rcv}_data`；TCP: `/sys/class/net/<iface>/statistics/{tx,rx}_bytes` |
+| `MemBW(MB)` | per-second 系统内存带宽 (MB/s) | Intel CPU 上 `pcm-memory` 后台采样取平均 |
+| `LLCmiss%` | LLC load miss 比 | `perf stat -a -e LLC-loads,LLC-load-misses`，包住整个 probe 时长 |
+
+不可用的列显 `-`（工具没装 / CPU 不支持 / PMU 不可读 / 在 VM 里）。
+
+## 装依赖
+
+```bash
+# perf stat（标配）
+apt install linux-tools-common linux-tools-generic
+echo 0 > /proc/sys/kernel/perf_event_paranoid   # 允许 system-wide 采样
+
+# Intel PCM（Intel 主机才有，AMD/ARM 没有）
+apt install intel-cmt-cat   # Ubuntu 23.04+；早期版本从 https://github.com/intel/pcm 源码编
+modprobe msr                # pcm-memory 需要 /dev/cpu/N/msr
+
+# Mellanox RDMA 计数器走 sysfs，无需额外工具
+# 仅需确认接口名和端口号：
+ls /sys/class/infiniband/    # → mlx5_0 mlx5_1 ...
+```
+
+`IB_DEVICE`, `IB_PORT`, `NET_IFACE` 可以用 env var 覆盖默认值：
+
+```bash
+IB_DEVICE=mlx5_2 IB_PORT=1 sudo bash scripts/bench_sim_compress.sh all <client_ip>
+```
+
+需要单独关掉某一类采集：
+
+```bash
+DISABLE_PCM=1 DISABLE_LLC=1 sudo bash scripts/bench_sim_compress.sh all <client_ip>
+```
+
+## 单机 (server = client) 用法
+
+`bench_sim_compress.sh all` 已经把所有采集嵌进去，跑完直接看总结表：
+
+```bash
+sudo bash scripts/bench_sim_compress.sh all 127.0.0.1
+```
+
+总结表样例（物理机 + Intel PCM 装好时）：
+
+```
+Combo     RW    IOPS      AvgLat(µs) TxBW(MB)   RxBW(MB)   MemBW(MB)   LLCmiss%
+baseline  write 850k      35          3300       3300       18000       12
+crc       write 320k      85          1250       1250       42000       28
+comp      write 180k      180         700        700        65000       38
+both      write 145k      225         565        565        82000       45
+```
+
+baseline → comp 横向看：
+
+- IOPS 跌（CPU 被 memcpy 吃掉）
+- 网络带宽**线性**跟着 IOPS 跌（IOPS × 4K = MB/s）
+- 内存带宽**飙升**（baseline 18 GB/s → both 82 GB/s，是 IOSTASH 失效后 DMA 写得绕道 DRAM 的直接证据）
+- LLC miss% **上升**（scratch 走多了把 L3 内容冲掉）
+
+## Server / Client 分离用法
+
+物理 NoF 测试通常 client 在另一台机器上。client 端的 perf/fio 跑在 client 上，
+但**很多关键计数器只在 server 端有意义**（server 的内存子系统才是被 CRC/
+压缩仿真冲击的对象；server 端 NIC 计数器反映出口带宽；client 的 NIC 计数器
+反映入口带宽，对称看）。
+
+### Server 端：先 setup，然后另开一个会话做 server 侧采集
+
+```bash
+# Session 1（保持开着）：起 target
+sudo bash scripts/bench_sim_compress.sh setup baseline 0 0 0 0
+
+# Session 2（在 client 那边的 perf 跑起来之前几秒启动）：
+sudo bash scripts/bench_sim_compress.sh server-measure baseline 30
+# → 后台跑 pcm-memory + perf stat 30 秒 + NIC 计数器 diff
+#   结果写到 /tmp/sim_compress_bench/measure-server-baseline.log
+```
+
+`server-measure` 子命令存在的意义就是：当 `probe` 跑在远程 client 上的时候，
+server 这边没人触发采集，需要用这个命令在 server 侧并行采集。`duration_s`
+最好等于 client 那边 `PERF_TIME`。
+
+### Client 端：跑 probe
+
+```bash
+sudo bash scripts/bench_sim_compress.sh probe baseline <server_ip>
+# 在 client 自己的 /tmp/sim_compress_bench/measure-baseline-{write,read}.log
+# 里有 client 侧 NIC 计数器 + （如果 client 也装了 pcm）client 内存带宽
+```
+
+### Server 端：teardown，切下一个 combo
+
+```bash
+sudo bash scripts/bench_sim_compress.sh teardown
+
+# 改 env var，重起，重做 server-measure：
+sudo bash scripts/bench_sim_compress.sh setup crc 0 0 50 50
+sudo bash scripts/bench_sim_compress.sh server-measure crc 30
+# ...
+```
+
+### 把 server 侧 measure log 拉回 client 合并
+
+server-measure 的输出是单个 KV 文件，scp 回来跟 client 的 measure log 放在
+同一个 `RESULTS_DIR` 下就行：
+
+```bash
+# 在 client 端
+scp server:/tmp/sim_compress_bench/measure-server-*.log /tmp/sim_compress_bench/
+```
+
+然后 client 端跑 `bench_sim_compress.sh summary`（如果想自己加一列 server-side
+mem_mbps / llc_miss_pct，复制 summarize 函数改一下 `_mread` 取 server log 即可，
+这里不展开）。
+
+---
+
 # 排错速查
 
 | 现象 | 原因 | 处理 |
@@ -314,20 +438,28 @@ PRESET=orbstack sudo bash scripts/bench_sim_compress.sh all 127.0.0.1
 
 ## A.1 OrbStack aarch64 实测
 
-`PERF_TIME=30 PRESET=orbstack PERF_BS=4096 PERF_QD=1`，TCP loopback，
-3×malloc bdev：
+`PERF_TIME=15 PRESET=orbstack`，TCP loopback，3×malloc bdev：
 
-| Combo | comp w/r | crc w/r | RW | IOPS | AvgLat | delta |
-|---|---|---|---|---|---|---|
-| baseline | 0/0 | 0/0 | write | 24.4k | 39.78 µs | — |
-| baseline | 0/0 | 0/0 | read  | 23.9k | 40.71 µs | — |
-| crc      | 0/0 | 50/50 | write | 9560 | 103.15 µs | +63 |
-| crc      | 0/0 | 50/50 | read  | 9988 | 98.81 µs | +58 |
-| comp     | 200/200 | 0/0 | write | 3827 | 259.67 µs | +220 |
-| comp     | 200/200 | 0/0 | read  | 3702 | 268.52 µs | +228 |
-| both     | 200/200 | 50/50 | write | 3002 | 331.39 µs | +292 |
-| both     | 200/200 | 50/50 | read  | 2950 | 337.42 µs | +297 |
+```
+Combo     RW    IOPS      AvgLat(µs) TxBW(MB)   RxBW(MB)   MemBW(MB)   LLCmiss%
+baseline  write 23.1k     42.16       94         94         -           -
+baseline  read  25.5k     38.16       104        104        -           -
+crc       write 7760      127.49      31         31         -           -
+crc       read  10.1k     97.38       41         41         -           -
+comp      write 3751      265.02      15         15         -           -
+comp      read  3872      256.76      15         15         -           -
+both      write 3213      309.63      13         13         -           -
+both      read  2919      340.97      11         11         -           -
+```
 
-延时增量与配置 us 吻合 ±15%。OrbStack VM 共享 macOS 内核，无 DDIO / IOSTASH，
-所以这里 memcpy-loop 跟 busywait 总延时看着差不多 —— 真正的差异要在物理
-机上跑出来才能看到（L3 cache 行为、内存带宽消耗、AMD vs Intel 子系统差异）。
+OrbStack VM 上：
+
+- **网络带宽**正常采集（`lo` 接口 byte 计数）；TxBW 和 RxBW 完全相同因为
+  loopback 每个发送字节也算 receive
+- **内存带宽** `-`：pcm-memory 只在 Intel CPU 上有，Apple Silicon ARM 没有
+- **LLCmiss%** `-`：OrbStack 共享 macOS kernel 没暴露 PMU，`perf stat
+  LLC-loads` 报 `<not supported>`
+
+延时和带宽都跟 IOPS 同比走，证明补丁逻辑通了。**真正的内存带宽 / DDIO /
+LLC 信号要在物理 Intel/AMD 主机上跑才能看到** —— 那里 baseline 和 comp
+的内存带宽差距应在 5–10× 之间（IOSTASH 失效的硬证据）。
