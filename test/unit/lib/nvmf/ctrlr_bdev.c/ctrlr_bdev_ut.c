@@ -215,8 +215,6 @@ DEFINE_STUB(spdk_bdev_copy_blocks, int,
 DEFINE_STUB(spdk_bdev_get_max_copy, uint32_t, (const struct spdk_bdev *bdev), 0);
 
 /* Stubs for compression-latency simulation (SPDK_SIM_COMPRESS). */
-DEFINE_STUB(spdk_get_ticks, uint64_t, (void), 0);
-DEFINE_STUB(spdk_get_ticks_hz, uint64_t, (void), 1000000000ULL);
 DEFINE_STUB(spdk_zmalloc, void *,
 	    (size_t size, size_t align, uint64_t *unused, int socket_id, uint32_t flags),
 	    NULL);
@@ -927,6 +925,74 @@ test_nvmf_bdev_ctrlr_nvme_passthru(void)
 	MOCK_SET(spdk_bdev_nvme_admin_passthru, 0);
 }
 
+static void
+test_sim_compress_expand(void)
+{
+	uint8_t payload[1000];
+	uint8_t *scratch;
+	struct iovec iov;
+	size_t written, i;
+
+	for (i = 0; i < sizeof(payload); i++) {
+		payload[i] = (uint8_t)(i & 0xff);
+	}
+
+	scratch = calloc(1, 64 * 1024);
+	SPDK_CU_ASSERT_FATAL(scratch != NULL);
+
+	memset(&g_sim_compress, 0, sizeof(g_sim_compress));
+	g_sim_compress.scratch = scratch;
+	g_sim_compress.scratch_len = 64 * 1024;
+	g_sim_compress.scratch_off = 0;
+	g_sim_compress.factor = 1.5;
+
+	iov.iov_base = payload;
+	iov.iov_len = sizeof(payload);
+
+	written = sim_compress_expand(&iov, 1);
+
+	/* factor 1.5 over 1000 bytes => 1500 bytes of memcpy output work */
+	CU_ASSERT(written == 1500);
+	CU_ASSERT(g_sim_compress.scratch_off == 1500);
+	/* first L bytes are the payload verbatim */
+	CU_ASSERT(memcmp(scratch, payload, sizeof(payload)) == 0);
+	/* the extra 0.5L bytes re-read the payload cyclically */
+	CU_ASSERT(memcmp(scratch + 1000, payload, 500) == 0);
+
+	free(scratch);
+	memset(&g_sim_compress, 0, sizeof(g_sim_compress));
+}
+
+static void
+test_sim_crc64_iov(void)
+{
+	uint8_t buf[256];
+	struct iovec iov[2];
+	uint64_t crc_full, crc_split, expect;
+	size_t i;
+
+	for (i = 0; i < sizeof(buf); i++) {
+		buf[i] = (uint8_t)((i * 7 + 1) & 0xff);
+	}
+
+	/* single segment matches the crc64 library directly */
+	iov[0].iov_base = buf;
+	iov[0].iov_len = sizeof(buf);
+	crc_full = sim_crc64_iov(iov, 1);
+	expect = crc64_ecma_refl(0, buf, sizeof(buf));
+	CU_ASSERT(crc_full == expect);
+	CU_ASSERT(crc_full != 0);
+
+	/* two segments chain the running crc across the whole payload */
+	iov[0].iov_base = buf;
+	iov[0].iov_len = 128;
+	iov[1].iov_base = buf + 128;
+	iov[1].iov_len = 128;
+	crc_split = sim_crc64_iov(iov, 2);
+	expect = crc64_ecma_refl(crc64_ecma_refl(0, buf, 128), buf + 128, 128);
+	CU_ASSERT(crc_split == expect);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -947,6 +1013,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_bdev_ctrlr_cmd);
 	CU_ADD_TEST(suite, test_nvmf_bdev_ctrlr_read_write_cmd);
 	CU_ADD_TEST(suite, test_nvmf_bdev_ctrlr_nvme_passthru);
+	CU_ADD_TEST(suite, test_sim_compress_expand);
+	CU_ADD_TEST(suite, test_sim_crc64_iov);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();

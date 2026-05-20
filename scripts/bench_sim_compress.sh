@@ -2,7 +2,7 @@
 # NVMe-oF sim_compress benchmark — drive nvmf_tgt through 4 sim combos.
 #
 # Subcommands:
-#   setup    <label> <comp_w_us> <comp_r_us> <crc_w_us> <crc_r_us>
+#   setup    <label> <comp_w> <comp_r> <crc_w> <crc_r>   (each 1/0 enable)
 #       start nvmf_tgt with given env vars, configure transport / bdev /
 #       subsystem / listener per MACHINE CONFIG below
 #   probe    <label> [target_ip]
@@ -28,6 +28,8 @@
 #   PERF_QD=1            INITIATOR=spdk_perf|fio  SPDK_DIR=/root/spdk
 #   NET_IFACE=enp23...   IB_DEVICE=mlx5_0         IB_PORT=1
 #   DISABLE_PCM=1        DISABLE_LLC=1            DISABLE_NET=1
+#   SPDK_SIM_COMPRESS_FACTOR=1.33  (codec output/input size ratio, global)
+#   SPDK_SIM_SCRATCH_KB=4096       (per-thread scratch buffer, global)
 #
 set -euo pipefail
 
@@ -232,10 +234,11 @@ measure_around() {
 
 start_tgt() {
     local label="$1" comp_w="$2" comp_r="$3" crc_w="$4" crc_r="$5"
-    export SPDK_SIM_COMPRESS_WRITE_US="$comp_w"
-    export SPDK_SIM_COMPRESS_READ_US="$comp_r"
-    export SPDK_SIM_CRC_WRITE_US="$crc_w"
-    export SPDK_SIM_CRC_READ_US="$crc_r"
+    export SPDK_SIM_COMPRESS_WRITE="$comp_w"
+    export SPDK_SIM_COMPRESS_READ="$comp_r"
+    export SPDK_SIM_CRC_WRITE="$crc_w"
+    export SPDK_SIM_CRC_READ="$crc_r"
+    export SPDK_SIM_COMPRESS_FACTOR="${SPDK_SIM_COMPRESS_FACTOR:-1.33}"
 
     rm -f "$SOCK"
     if have_hugepage; then
@@ -250,7 +253,7 @@ start_tgt() {
         sleep 0.2
     done
     [ -S "$SOCK" ] || { tail -30 "$TGT_LOG"; die "nvmf_tgt socket not up"; }
-    echo "==> [$label] nvmf_tgt up (comp=${comp_w}/${comp_r} crc=${crc_w}/${crc_r} µs)"
+    echo "==> [$label] nvmf_tgt up (comp_w/r=${comp_w}/${comp_r} crc_w/r=${crc_w}/${crc_r} factor=${SPDK_SIM_COMPRESS_FACTOR})"
 }
 
 create_transport() {
@@ -474,11 +477,12 @@ summarize() {
 
 cmd_all() {
     local target_ip="${1:-${_LISTEN_IPS_ARR[0]}}"
+    # label  comp_w comp_r crc_w crc_r  (each 1/0 enable)
     local combos=(
-        "baseline 0   0   0  0"
-        "crc      0   0   50 50"
-        "comp     200 200 0  0"
-        "both     200 200 50 50"
+        "baseline 0 0 0 0"
+        "crc      0 0 1 1"
+        "comp     1 1 0 0"
+        "both     1 1 1 1"
     )
     for combo in "${combos[@]}"; do
         # shellcheck disable=SC2086
@@ -502,6 +506,6 @@ case "$CMD" in
     summary)         summarize ;;
     server-measure)  cmd_server_measure "$@" ;;
     help|*)
-        sed -n '2,32p' "$0"
+        sed -n '2,33p' "$0"
         ;;
 esac

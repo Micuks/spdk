@@ -4,35 +4,45 @@
 
 ## 这是什么
 
-在 SPDK NVMe-oF target 的 bdev 读写路径上，运行一段**时间受限的 memcpy
-循环**，模拟 CRC 计算和压缩/解压的 CPU + 内存带宽开销，无需引入真实的
-ISA-L 或 DPDK_compressdev。
+在 SPDK NVMe-oF target 的 bdev 读写路径上，做一份**和数据量成正比的真实
+工作**，模拟 CRC 计算和压缩/解压的 CPU + 内存带宽开销，无需引入真实的
+DPDK_compressdev。延时不是配出来的固定 µs，而是由 block size + 因子 + crc64
+计算量自然决定的（数据越大、工作越多）。
 
-每个阶段（CRC、Compress）独立可调。流水线顺序匹配实际存储路径：
+每个阶段（CRC、Compress）独立可开关。流水线顺序匹配实际存储路径：
 
 ```
-write_cmd:  CRC memcpy-for-us  →  compress memcpy-for-us  →  bdev submit
-read_cmd:   bdev complete  →  decompress memcpy-for-us  →  CRC validate memcpy-for-us
+write_cmd:  CRC 扫描  →  compress 扩张  →  bdev submit
+read_cmd:   bdev complete  →  decompress 扩张  →  CRC 校验
 ```
 
-仿真的关键性质：**memcpy 在 per-thread scratch 上用移动指针走，每次循环
-都打到新的 cache line / DRAM 行**。scratch 默认 4 MiB（大于典型 L2），所以
-循环会真正消耗 L3 / 内存带宽，把 IOSTASH 写进 L3 的内容冲掉 —— 这正是
-要测的开启 CRC/压缩后内存子系统压力。
+两类工作：
+
+- **压缩 / 解压**：把 payload memcpy 进 per-thread scratch，输出 `factor × L`
+  字节（默认 1.33 倍，模拟 codec 的输出 / 工作集大于输入）。目标字节数 > L
+  时循环重读 payload 凑够。**目的地指针在 scratch 上移动走**，每次都打到新
+  cache line / DRAM 行；scratch 默认 4 MiB（大于典型 L2），所以会真正消耗
+  L3 / 内存带宽，把 IOSTASH 写进 L3 的内容冲掉 —— 这正是要测的内存子系统压力。
+- **CRC**：对 payload 跑 crc64（isa-l `crc64_ecma_refl`），和真实数据完整性
+  校验一样的全量扫描。
 
 ## 旋钮
 
-五个环境变量，nvmf_tgt 启动时读一次，之后不变：
+环境变量，nvmf_tgt 启动后**第一次进 I/O**时读一次，之后不变：
 
 | 变量 | 含义 | 默认 |
 |---|---|---|
-| `SPDK_SIM_COMPRESS_WRITE_US` | 写路径压缩 memcpy 目标耗时（µs） | `0` |
-| `SPDK_SIM_COMPRESS_READ_US`  | 读路径解压 memcpy 目标耗时（µs） | `0` |
-| `SPDK_SIM_CRC_WRITE_US`      | 写路径 CRC memcpy 目标耗时（µs） | `0` |
-| `SPDK_SIM_CRC_READ_US`       | 读路径 CRC 校验 memcpy 目标耗时（µs） | `0` |
-| `SPDK_SIM_SCRATCH_KB`        | per-thread scratch 大小（KiB） | `4096` |
+| `SPDK_SIM_COMPRESS_WRITE`   | 写路径压缩开关（1/0） | `0` |
+| `SPDK_SIM_COMPRESS_READ`    | 读路径解压开关（1/0） | `0` |
+| `SPDK_SIM_CRC_WRITE`        | 写路径 CRC 开关（1/0） | `0` |
+| `SPDK_SIM_CRC_READ`         | 读路径 CRC 校验开关（1/0） | `0` |
+| `SPDK_SIM_COMPRESS_FACTOR`  | 压缩 / 解压输出 ÷ 输入 倍数 | `1.33` |
+| `SPDK_SIM_SCRATCH_KB`       | per-thread scratch 大小（KiB） | `4096` |
 
-全 0 = 不做任何 memcpy（`target_tsc == 0` 直接 return）。
+四个开关全 0 = 不做任何额外工作（baseline）。值非空且首字符非 `0` 即为开。
+
+`FACTOR` 控制压缩阶段的内存搬运量：1.33 表示每个 I/O 多搬 33% 的数据。想
+让压缩延时更大就调高（如 `2.0`），`< 1.0` 会被夹到 1.0（至少把 payload 读一遍）。
 
 scratch 默认 4 MiB 够冲掉典型 L2。要冲掉 LLC（典型 32–64 MiB）建议设到
 `65536`（64 MiB）：
@@ -108,20 +118,21 @@ nmcli connection up enp23s0f1np1
 
 ```bash
 # baseline 不加任何 sim
-unset SPDK_SIM_COMPRESS_WRITE_US SPDK_SIM_COMPRESS_READ_US \
-      SPDK_SIM_CRC_WRITE_US     SPDK_SIM_CRC_READ_US
+unset SPDK_SIM_COMPRESS_WRITE SPDK_SIM_COMPRESS_READ \
+      SPDK_SIM_CRC_WRITE       SPDK_SIM_CRC_READ
 
-# 或者：CRC + 压缩都开
-export SPDK_SIM_COMPRESS_WRITE_US=200
-export SPDK_SIM_COMPRESS_READ_US=200
-export SPDK_SIM_CRC_WRITE_US=50
-export SPDK_SIM_CRC_READ_US=50
+# 或者：CRC + 压缩都开（both）
+export SPDK_SIM_COMPRESS_WRITE=1
+export SPDK_SIM_COMPRESS_READ=1
+export SPDK_SIM_CRC_WRITE=1
+export SPDK_SIM_CRC_READ=1
+export SPDK_SIM_COMPRESS_FACTOR=1.33   # 可选，默认 1.33
 
 # 起 target
 ./build/bin/nvmf_tgt -m 0x30 &
 ```
 
-`SPDK_SIM_*_US` 是 reactor 线程**第一次进 I/O** 时读取并缓存的。运行中改
+`SPDK_SIM_*` 是 reactor 线程**第一次进 I/O** 时读取并缓存的。运行中改
 环境变量不会重新生效，**必须 kill nvmf_tgt 后重起**。
 
 ## 6. 配 transport / bdev / subsystem / listener
@@ -156,11 +167,11 @@ export SPDK_SIM_CRC_READ_US=50
 pkill -9 -f build/bin/nvmf_tgt
 sleep 1
 
-# 改 env var
-export SPDK_SIM_COMPRESS_WRITE_US=...
-export SPDK_SIM_COMPRESS_READ_US=...
-export SPDK_SIM_CRC_WRITE_US=...
-export SPDK_SIM_CRC_READ_US=...
+# 改 env var（开关 1/0）
+export SPDK_SIM_COMPRESS_WRITE=...
+export SPDK_SIM_COMPRESS_READ=...
+export SPDK_SIM_CRC_WRITE=...
+export SPDK_SIM_CRC_READ=...
 
 # 重起 + 重做第 6 步的 RPC 配置
 ./build/bin/nvmf_tgt -m 0x30 &
@@ -193,16 +204,18 @@ Client 跑 SPDK 自带 perf 当 initiator，指向 server 的某个 listener IP�
 
 每个 combo = server 重起一次（带不同 env var）+ client 跑一对 read/write：
 
-| label | SPDK_SIM_COMPRESS_WRITE/READ_US | SPDK_SIM_CRC_WRITE/READ_US | 含义 |
+| label | COMPRESS_WRITE/READ | CRC_WRITE/READ | 含义 |
 |---|---|---|---|
 | baseline | 0 / 0 | 0 / 0 | 干净路径，IOSTASH 仍生效 |
-| crc      | 0 / 0 | 50 / 50 | 仅 CRC 路径上的 memcpy + 内存带宽消耗 |
-| comp     | 200 / 200 | 0 / 0 | 仅压缩路径 |
-| both     | 200 / 200 | 50 / 50 | 实际部署形态 |
+| crc      | 0 / 0 | 1 / 1 | 仅 CRC：对 payload 跑 crc64 全量扫描 |
+| comp     | 1 / 1 | 0 / 0 | 仅压缩：memcpy 出 1.33×payload，冲 L3 |
+| both     | 1 / 1 | 1 / 1 | 实际部署形态 |
 
-50 µs 和 200 µs 是占位数。实际值按你的目标硬件（或目标加速卡）延时调，
-典型软件 CRC32 per 4 KiB ≈ 20–50 µs，软件 zstd-fast per 4 KiB ≈
-100–300 µs。
+延时不是配出来的，是按 block size 算出来的：压缩搬 `factor × block`，crc64
+扫一遍 `block`。**所以 block 越大，combo 与 baseline 的 delta 越明显**；4 KiB
+小块上每个 I/O 的额外工作不到 1 µs，会被网络往返淹没，要看效果用大 block
+（如 1 MiB）。想放大压缩开销调 `SPDK_SIM_COMPRESS_FACTOR`，想冲 LLC 调
+`SPDK_SIM_SCRATCH_KB=65536`。
 
 ---
 
@@ -213,10 +226,11 @@ Client 跑 SPDK 自带 perf 当 initiator，指向 server 的某个 listener IP�
 ## 子命令
 
 ```bash
-# Server 端
-sudo bash scripts/bench_sim_compress.sh setup baseline 0 0 0 0
+# setup 参数：<label> <comp_w> <comp_r> <crc_w> <crc_r>，后四个是 1/0 开关
+# Server 端（这里跑 both：压缩 + CRC 全开）
+sudo bash scripts/bench_sim_compress.sh setup both 1 1 1 1
 # Client 端（也可以是同一台机器）
-sudo bash scripts/bench_sim_compress.sh probe baseline <server_ip>
+sudo bash scripts/bench_sim_compress.sh probe both <server_ip>
 # Server 端
 sudo bash scripts/bench_sim_compress.sh teardown
 ```
@@ -301,15 +315,19 @@ DISABLE_PCM=1 DISABLE_LLC=1 sudo bash scripts/bench_sim_compress.sh all <client_
 sudo bash scripts/bench_sim_compress.sh all 127.0.0.1
 ```
 
-总结表样例（物理机 + Intel PCM 装好时）：
+总结表样例（1 MiB block，体现增量叠加；MemBW/LLCmiss 列需 Intel PCM /
+可读 PMU，否则显示 `-`）：
 
 ```
 Combo     RW    IOPS      AvgLat(µs) TxBW(MB)   RxBW(MB)   MemBW(MB)   LLCmiss%
-baseline  write 850k      35          3300       3300       18000       12
-crc       write 320k      85          1250       1250       42000       28
-comp      write 180k      180         700        700        65000       38
-both      write 145k      225         565        565        82000       45
+baseline  write 2490      400         2499       2499       18000       12
+crc       write 2092      476         2100       2100       34000       24
+comp      write 1997      498         2005       2005       52000       33
+both      write 2000      498         2008       2008       60000       38
 ```
+
+baseline 最快，crc / comp 各叠一档延时，both 最大 —— 延时是 block 越大越明显。
+4 KiB 小块上每 I/O 额外工作 < 1 µs，看不出 delta，这是数据正比模型的预期。
 
 baseline → comp 横向看：
 
@@ -383,23 +401,26 @@ mem_mbps / llc_miss_pct，复制 summarize 函数改一下 `_mread` 取 server l
 | `nvmf_tgt` 启动报 `Cannot get hugepage information` | 没分配 hugepage | `echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages` 后 `mount -t hugetlbfs nodev /dev/hugepages` |
 | `bind() failed at port 4420, errno = 98` | 旧的 nvmf_tgt 没退干净 | `pkill -9 -f build/bin/nvmf_tgt` 后重起 |
 | `bdev_nvme_attach_controller` 报 device busy | NVMe 还在内核驱动上 | 先跑 `PCI_ALLOWED=... ./scripts/setup.sh` 绑到 vfio/uio |
-| 没有 `sim_compress: enabled` 日志 | 编译期没带 patch | 检查 `lib/nvmf/ctrlr_bdev.c` 顶部 `SPDK_SIM_COMPRESS=1`，重新 `make` |
-| 改了 `SPDK_SIM_*_US` 延时不变 | env var 没透传，或 nvmf_tgt 没重启 | env var 必须 `export` 后再启 nvmf_tgt；运行中改无效，要重启 |
+| 没有 `sim_compress: scratch=...` 日志 | 编译期没带 patch，或还没有 I/O 触发惰性 init | 检查 `lib/nvmf/ctrlr_bdev.c` 顶部 `SPDK_SIM_COMPRESS=1` 重新 `make`；日志在第一个 I/O 后才打 |
+| 改了 `SPDK_SIM_*` 延时不变 | env var 没透传，或 nvmf_tgt 没重启 | env var 必须 `export` 后再启 nvmf_tgt；运行中改无效，要重启 |
+| 开了 sim 但 4 KiB 小块看不出 delta | 预期：工作量与数据量成正比，4 KiB 的额外工作 < 1 µs | 用大 block（1 MiB）测，或调高 `SPDK_SIM_COMPRESS_FACTOR` |
 | client perf 报 `Failed to initialize DPDK` | initiator 那边也要 hugepage | client 主机上同样 `echo 1024 > .../nr_hugepages` |
-| 同样 us 配置在两台机器上延时差很多 | 这是设计上的预期 —— memcpy 吞吐受 DDR 代数 / NUMA / hugepage / CPU 频率影响 | 跨机比较时报 **combo - baseline 的 delta**，不报绝对值 |
+| 同样配置在两台机器上 delta 差很多 | 这是设计上的预期 —— memcpy / crc64 吞吐受 DDR 代数 / NUMA / hugepage / CPU 频率影响 | 跨机比较时报 **combo - baseline 的 delta**，不报绝对值 |
 
 ---
 
 # 实现要点
 
-- **memcpy-for-us 循环**：`sim_compress_memcpy_for_us(iov, iovcnt, target_tsc)`
-  在 scratch 上用**移动指针**重复拷贝 payload，直到 `spdk_get_ticks() -
-  start >= target_tsc`。每次循环写到 scratch 的不同偏移，避免每次都打到
-  同一条 L1/L2 cache line。
+- **压缩 / 解压 = 定额 memcpy**：`sim_compress_expand(iov, iovcnt)` 把 payload
+  拷进 scratch，输出 `factor × L` 字节（`L` = 本次 I/O 总长）。目的地指针在
+  scratch 上**移动走**，每次都打到新 cache line；目标字节数 > L 时循环重读
+  payload 凑够。工作量正比于数据量，不是按时间自旋。
+- **CRC = 真 crc64**：`sim_crc64_iov(iov, iovcnt)` 对 payload 跑 isa-l
+  `crc64_ecma_refl`（`#ifdef SPDK_CONFIG_ISAL`），跨 iov 段链式累加。结果异或
+  进 `crc_sink` 防止编译器把计算优化掉。
 - **Scratch 大小**：默认 4 MiB（`SPDK_SIM_SCRATCH_KB=4096`），大于任何
   现代 CPU 单核 L2。要超过 LLC 强制 DRAM 流量，设到 `65536` (64 MiB)。
   per-reactor-thread 各自一块，`spdk_zmalloc` 分配 DMA-able 内存。
-- **每阶段独立循环**：CRC 一次 + Compress 一次，模拟两次独立数据扫描。
 - **不修改 payload**：scratch 是写入目标，`req->iov` 原数据不动，提交到
   底层 bdev 的依然是原指针。
 - **只挂 bdev 路径**：admin cmd、zcopy、compare-and-write、fused 等不动。
@@ -411,7 +432,8 @@ mem_mbps / llc_miss_pct，复制 summarize 函数改一下 `_mread` 取 server l
 ./test/unit/lib/nvmf/ctrlr_bdev.c/ctrlr_bdev_ut
 ```
 
-应当报 9/9 tests, 156/156 asserts 全过。
+应当报 11/11 tests, 164/164 asserts 全过（含 `test_sim_compress_expand`
+验证 `factor × L` 字节数 + 循环重读，`test_sim_crc64_iov` 验证 crc64 全量扫描）。
 
 ---
 

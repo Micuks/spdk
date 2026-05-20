@@ -25,23 +25,29 @@
 /*
  * Compression + CRC latency simulation.
  *
- * Runs a time-bounded memcpy loop around the NVMe-oF read/write path. Each
- * stage (CRC, Compress) walks payload into a per-thread scratch buffer using
- * a moving destination pointer, looping until the configured target us is
- * reached. Walking destination means consecutive memcpys hit fresh cache
- * lines / DRAM rather than the same L1 line, so the simulation reflects the
- * actual L3 / memory bandwidth pressure of real CRC + compression — and
- * thrashes IOSTASH'd content out of L3 the same way real codecs would.
+ * The work each stage does is proportional to the payload size, so the added
+ * latency emerges from real memory traffic rather than a spin loop:
  *
- *   SPDK_SIM_COMPRESS_WRITE_US   write-path compression target latency
- *   SPDK_SIM_COMPRESS_READ_US    read-path decompression target latency
- *   SPDK_SIM_CRC_WRITE_US        write-path CRC compute target latency
- *   SPDK_SIM_CRC_READ_US         read-path CRC validation target latency
- *   SPDK_SIM_SCRATCH_KB          per-thread scratch size in KiB (default 4096)
+ *   Compress / decompress: memcpy the payload into a per-thread scratch buffer,
+ *     producing FACTOR * payload bytes of output (default 1.33x, modelling a
+ *     codec whose output/working set is larger than the input). The walking
+ *     destination pointer touches fresh cache lines, so with scratch > L2 this
+ *     generates real L3/DRAM traffic and evicts IOSTASH'd content from L3 the
+ *     same way a real codec would.
+ *
+ *   CRC: run crc64 (isa-l crc64_ecma_refl) over the payload, the same scan a
+ *     real data-integrity check performs.
+ *
+ *   SPDK_SIM_COMPRESS_WRITE   1/0  enable write-path compression
+ *   SPDK_SIM_COMPRESS_READ    1/0  enable read-path decompression
+ *   SPDK_SIM_CRC_WRITE        1/0  enable write-path CRC
+ *   SPDK_SIM_CRC_READ         1/0  enable read-path CRC validation
+ *   SPDK_SIM_COMPRESS_FACTOR  float, output/input size ratio (default 1.33)
+ *   SPDK_SIM_SCRATCH_KB       per-thread scratch size in KiB (default 4096)
  *
  * Pipeline order:
- *   write_cmd: CRC memcpy-for-us → compress memcpy-for-us → bdev submit
- *   read_cmd : bdev complete → decompress memcpy-for-us → CRC memcpy-for-us
+ *   write_cmd: CRC scan → compress expand → bdev submit
+ *   read_cmd : bdev complete → decompress expand → CRC scan
  *
  * Set the macro to 0 (or build with -DSPDK_SIM_COMPRESS=0) to disable.
  */
@@ -52,35 +58,40 @@
 #if SPDK_SIM_COMPRESS
 
 #include "spdk/env.h"
+#include "spdk/config.h"
+#ifdef SPDK_CONFIG_ISAL
+#include <isa-l/include/crc64.h>
+#endif
 
 #define SPDK_SIM_SCRATCH_KB_DEFAULT (4 * 1024)   /* 4 MiB, larger than typical L2 */
 #define SPDK_SIM_SCRATCH_KB_MIN     64
+#define SPDK_SIM_FACTOR_DEFAULT     1.33
 
 struct sim_compress_state {
 	bool		inited;
-	uint64_t	compress_w_tsc;
-	uint64_t	compress_r_tsc;
-	uint64_t	crc_w_tsc;
-	uint64_t	crc_r_tsc;
+	bool		compress_w;
+	bool		compress_r;
+	bool		crc_w;
+	bool		crc_r;
+	double		factor;
 	void		*scratch;
 	size_t		scratch_len;
 	size_t		scratch_off;	/* walking destination pointer */
+	uint64_t	crc_sink;	/* keeps crc results live, defeats DCE */
 };
 
 static __thread struct sim_compress_state g_sim_compress;
 
-static inline uint64_t
-sim_env_us_to_tsc(const char *name, uint64_t hz)
+static inline bool
+sim_env_bool(const char *name)
 {
 	const char *env = getenv(name);
-	uint64_t us = env ? strtoull(env, NULL, 10) : 0;
-	return (hz * us) / 1000000ULL;
+	return env != NULL && env[0] != '\0' && env[0] != '0';
 }
 
 static void
 sim_compress_init_once(void)
 {
-	uint64_t hz;
 	const char *env;
 	size_t scratch_kb;
 
@@ -89,11 +100,17 @@ sim_compress_init_once(void)
 	}
 	g_sim_compress.inited = true;
 
-	hz = spdk_get_ticks_hz();
-	g_sim_compress.compress_w_tsc = sim_env_us_to_tsc("SPDK_SIM_COMPRESS_WRITE_US", hz);
-	g_sim_compress.compress_r_tsc = sim_env_us_to_tsc("SPDK_SIM_COMPRESS_READ_US",  hz);
-	g_sim_compress.crc_w_tsc      = sim_env_us_to_tsc("SPDK_SIM_CRC_WRITE_US",      hz);
-	g_sim_compress.crc_r_tsc      = sim_env_us_to_tsc("SPDK_SIM_CRC_READ_US",       hz);
+	g_sim_compress.compress_w = sim_env_bool("SPDK_SIM_COMPRESS_WRITE");
+	g_sim_compress.compress_r = sim_env_bool("SPDK_SIM_COMPRESS_READ");
+	g_sim_compress.crc_w      = sim_env_bool("SPDK_SIM_CRC_WRITE");
+	g_sim_compress.crc_r      = sim_env_bool("SPDK_SIM_CRC_READ");
+
+	env = getenv("SPDK_SIM_COMPRESS_FACTOR");
+	g_sim_compress.factor = env ? strtod(env, NULL) : SPDK_SIM_FACTOR_DEFAULT;
+	if (g_sim_compress.factor < 1.0) {
+		/* never do less memcpy work than reading the payload once */
+		g_sim_compress.factor = 1.0;
+	}
 
 	env = getenv("SPDK_SIM_SCRATCH_KB");
 	scratch_kb = env ? strtoull(env, NULL, 10) : SPDK_SIM_SCRATCH_KB_DEFAULT;
@@ -105,68 +122,101 @@ sim_compress_init_once(void)
 					      NULL, SPDK_ENV_SOCKET_ID_ANY,
 					      SPDK_MALLOC_DMA);
 	if (g_sim_compress.scratch == NULL) {
-		SPDK_WARNLOG("sim_compress: scratch alloc failed; sim disabled\n");
+		SPDK_WARNLOG("sim_compress: scratch alloc failed; compress sim disabled\n");
 		g_sim_compress.scratch_len = 0;
 	}
 	g_sim_compress.scratch_off = 0;
 
-	SPDK_NOTICELOG("sim_compress: enabled scratch=%zu KiB "
-		       "compress_w_us=%" PRIu64 " compress_r_us=%" PRIu64 " "
-		       "crc_w_us=%" PRIu64 " crc_r_us=%" PRIu64 "\n",
-		       g_sim_compress.scratch_len / 1024,
-		       g_sim_compress.compress_w_tsc * 1000000ULL / hz,
-		       g_sim_compress.compress_r_tsc * 1000000ULL / hz,
-		       g_sim_compress.crc_w_tsc      * 1000000ULL / hz,
-		       g_sim_compress.crc_r_tsc      * 1000000ULL / hz);
+	SPDK_NOTICELOG("sim_compress: scratch=%zu KiB factor=%.3f "
+		       "compress_w=%d compress_r=%d crc_w=%d crc_r=%d\n",
+		       g_sim_compress.scratch_len / 1024, g_sim_compress.factor,
+		       g_sim_compress.compress_w, g_sim_compress.compress_r,
+		       g_sim_compress.crc_w, g_sim_compress.crc_r);
 }
 
 /*
- * memcpy payload into a moving destination inside scratch, looping until
- * target_tsc has elapsed. Walking the destination pointer means each loop
- * iteration touches fresh cache lines: with scratch > L2 this generates real
- * L3/DRAM traffic and evicts unrelated lines (IOSTASH'd content included),
- * matching the memory-system footprint of true CRC + compression scans.
+ * memcpy the payload into a moving destination inside scratch, producing
+ * factor * payload_len bytes of output (the payload is re-read cyclically to
+ * reach the target size when factor > 1). Walking the destination touches
+ * fresh cache lines, so with scratch > L2 this generates real L3/DRAM traffic
+ * and evicts IOSTASH'd content from L3, matching a real codec's footprint.
+ * Returns the number of bytes written.
  */
-static inline void
-sim_compress_memcpy_for_us(struct iovec *iov, int iovcnt, uint64_t target_tsc)
+static inline size_t
+sim_compress_expand(struct iovec *iov, int iovcnt)
 {
-	uint64_t start;
+	size_t total_in = 0, total_out, written = 0, pos = 0;
 	int i;
-	size_t n, left, avail;
-	const char *src;
 
-	if (target_tsc == 0 || g_sim_compress.scratch == NULL) {
-		return;
+	if (g_sim_compress.scratch == NULL) {
+		return 0;
 	}
-	start = spdk_get_ticks();
-	do {
-		for (i = 0; i < iovcnt; i++) {
-			src = iov[i].iov_base;
-			left = iov[i].iov_len;
-			while (left) {
-				avail = g_sim_compress.scratch_len - g_sim_compress.scratch_off;
-				n = spdk_min(left, avail);
-				memcpy((char *)g_sim_compress.scratch + g_sim_compress.scratch_off,
-				       src, n);
-				g_sim_compress.scratch_off += n;
-				if (g_sim_compress.scratch_off >= g_sim_compress.scratch_len) {
-					g_sim_compress.scratch_off = 0;
-				}
-				src += n;
-				left -= n;
-			}
+	for (i = 0; i < iovcnt; i++) {
+		total_in += iov[i].iov_len;
+	}
+	if (total_in == 0) {
+		return 0;
+	}
+	total_out = (size_t)(total_in * g_sim_compress.factor);
+
+	i = 0;
+	while (written < total_out) {
+		const char *src;
+		size_t seg_left, avail, n;
+
+		if (i >= iovcnt) {
+			i = 0;	/* wrap: re-read the payload to reach factor * L */
 		}
-	} while ((spdk_get_ticks() - start) < target_tsc);
+		if (iov[i].iov_len == 0) {
+			i++;
+			continue;
+		}
+		src = (const char *)iov[i].iov_base + pos;
+		seg_left = iov[i].iov_len - pos;
+		avail = g_sim_compress.scratch_len - g_sim_compress.scratch_off;
+		n = spdk_min(seg_left, avail);
+		n = spdk_min(n, total_out - written);
+		memcpy((char *)g_sim_compress.scratch + g_sim_compress.scratch_off, src, n);
+		g_sim_compress.scratch_off += n;
+		if (g_sim_compress.scratch_off >= g_sim_compress.scratch_len) {
+			g_sim_compress.scratch_off = 0;
+		}
+		pos += n;
+		written += n;
+		if (pos >= iov[i].iov_len) {
+			pos = 0;
+			i++;
+		}
+	}
+	return written;
+}
+
+/* crc64 over the whole payload, chaining the running crc across iov segments. */
+static inline uint64_t
+sim_crc64_iov(struct iovec *iov, int iovcnt)
+{
+	uint64_t crc = 0;
+#ifdef SPDK_CONFIG_ISAL
+	int i;
+
+	for (i = 0; i < iovcnt; i++) {
+		crc = crc64_ecma_refl(crc, (const unsigned char *)iov[i].iov_base,
+				      iov[i].iov_len);
+	}
+#endif
+	return crc;
 }
 
 static inline void
 sim_compress_apply_write(struct spdk_nvmf_request *req)
 {
 	sim_compress_init_once();
-	/* CRC: scan payload, walking scratch for the configured target us. */
-	sim_compress_memcpy_for_us(req->iov, req->iovcnt, g_sim_compress.crc_w_tsc);
-	/* Compress: scan payload, walking scratch for the configured target us. */
-	sim_compress_memcpy_for_us(req->iov, req->iovcnt, g_sim_compress.compress_w_tsc);
+	if (g_sim_compress.crc_w) {
+		g_sim_compress.crc_sink ^= sim_crc64_iov(req->iov, req->iovcnt);
+	}
+	if (g_sim_compress.compress_w) {
+		sim_compress_expand(req->iov, req->iovcnt);
+	}
 }
 
 static void nvmf_bdev_ctrlr_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
@@ -178,10 +228,12 @@ sim_decompress_complete_cmd(struct spdk_bdev_io *bdev_io, bool success, void *cb
 	struct spdk_nvmf_request *req = cb_arg;
 
 	if (spdk_likely(success)) {
-		/* Decompress: scan + walk scratch. */
-		sim_compress_memcpy_for_us(req->iov, req->iovcnt, g_sim_compress.compress_r_tsc);
-		/* CRC validate: scan + walk scratch. */
-		sim_compress_memcpy_for_us(req->iov, req->iovcnt, g_sim_compress.crc_r_tsc);
+		if (g_sim_compress.compress_r) {
+			sim_compress_expand(req->iov, req->iovcnt);
+		}
+		if (g_sim_compress.crc_r) {
+			g_sim_compress.crc_sink ^= sim_crc64_iov(req->iov, req->iovcnt);
+		}
 	}
 	nvmf_bdev_ctrlr_complete_cmd(bdev_io, success, req);
 }
