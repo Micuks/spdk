@@ -991,6 +991,28 @@ test_sim_crc64_iov(void)
 	CU_ASSERT(crc_split == expect);
 }
 
+static void
+test_sim_crc64_sw(void)
+{
+	uint8_t buf[256];
+	uint64_t whole, chained;
+	size_t i;
+
+	for (i = 0; i < sizeof(buf); i++) {
+		buf[i] = (uint8_t)((i * 31 + 5) & 0xff);
+	}
+
+	/* the software fallback does real work: non-empty payload yields a
+	 * deterministic, non-zero crc (never a silent no-op) */
+	whole = sim_crc64_sw(0, buf, sizeof(buf));
+	CU_ASSERT(whole != 0);
+	CU_ASSERT(sim_crc64_sw(0, buf, sizeof(buf)) == whole);
+
+	/* streaming: chaining two halves equals the one-shot crc */
+	chained = sim_crc64_sw(sim_crc64_sw(0, buf, 128), buf + 128, 128);
+	CU_ASSERT(chained == whole);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1013,6 +1035,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_bdev_ctrlr_nvme_passthru);
 	CU_ADD_TEST(suite, test_sim_compress_expand);
 	CU_ADD_TEST(suite, test_sim_crc64_iov);
+	CU_ADD_TEST(suite, test_sim_crc64_sw);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();

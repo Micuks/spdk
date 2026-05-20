@@ -408,8 +408,9 @@ mem_mbps / llc_miss_pct，复制 summarize 函数改一下 `_mread` 取 server l
   拷进 scratch，一轮跑完输出 `factor × L` 字节（`L` = 本次 I/O 总长）；目标
   字节数 > L 时循环重读 payload 凑够。工作量正比于数据量，不是按时间自旋。
 - **CRC = 真 crc64**：`sim_crc64_iov(iov, iovcnt)` 对 payload 跑 isa-l
-  `crc64_ecma_refl`（`#ifdef SPDK_CONFIG_ISAL`），跨 iov 段链式累加。结果异或
-  进 `crc_sink` 防止编译器把计算优化掉。
+  `crc64_ecma_refl`，跨 iov 段链式累加，结果异或进 `crc_sink` 防止编译器把
+  计算优化掉。没有 isa-l（`#ifndef SPDK_CONFIG_ISAL`）时退到软件 crc64
+  (`sim_crc64_sw`)，仍逐字节扫一遍 payload —— 不会变成静默空操作。
 - **Scratch**：压缩 memcpy 的目标缓冲，默认 4 MiB（`SPDK_SIM_SCRATCH_KB=4096`），
   够装 `factor × 单次最大 I/O`。per-reactor-thread 各自一块，`spdk_zmalloc`
   分配 DMA-able 内存。
@@ -424,8 +425,9 @@ mem_mbps / llc_miss_pct，复制 summarize 函数改一下 `_mread` 取 server l
 ./test/unit/lib/nvmf/ctrlr_bdev.c/ctrlr_bdev_ut
 ```
 
-应当报 11/11 tests, 163/163 asserts 全过（含 `test_sim_compress_expand`
-验证 `factor × L` 字节数 + 循环重读，`test_sim_crc64_iov` 验证 crc64 全量扫描）。
+应当报 12/12 tests, 166/166 asserts 全过（含 `test_sim_compress_expand`
+验证 `factor × L` 字节数 + 循环重读，`test_sim_crc64_iov` 验证 crc64 全量扫描，
+`test_sim_crc64_sw` 验证软件兜底逐字节做真实工作）。
 
 ---
 

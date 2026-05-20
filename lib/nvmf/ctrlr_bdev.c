@@ -184,19 +184,42 @@ sim_compress_expand(struct iovec *iov, int iovcnt)
 	return written;
 }
 
+/*
+ * Software CRC-64 (reflected ECMA-182 / "XZ" polynomial), used to keep the CRC
+ * simulation doing real per-byte work on builds without isa-l. Streaming form:
+ * chaining the running crc across segments equals the one-shot crc.
+ */
+static inline uint64_t
+sim_crc64_sw(uint64_t crc, const unsigned char *buf, size_t len)
+{
+	size_t i;
+	int b;
+
+	for (i = 0; i < len; i++) {
+		crc ^= (uint64_t)buf[i];
+		for (b = 0; b < 8; b++) {
+			crc = (crc & 1) ? (crc >> 1) ^ 0xC96C5795D7870F42ULL : (crc >> 1);
+		}
+	}
+	return crc;
+}
+
 /* crc64 over the whole payload, chaining the running crc across iov segments. */
 static inline uint64_t
 sim_crc64_iov(struct iovec *iov, int iovcnt)
 {
 	uint64_t crc = 0;
-#ifdef SPDK_CONFIG_ISAL
 	int i;
 
 	for (i = 0; i < iovcnt; i++) {
+#ifdef SPDK_CONFIG_ISAL
 		crc = crc64_ecma_refl(crc, (const unsigned char *)iov[i].iov_base,
 				      iov[i].iov_len);
-	}
+#else
+		crc = sim_crc64_sw(crc, (const unsigned char *)iov[i].iov_base,
+				   iov[i].iov_len);
 #endif
+	}
 	return crc;
 }
 
