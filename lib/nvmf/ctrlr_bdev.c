@@ -29,11 +29,8 @@
  * latency emerges from real memory traffic rather than a spin loop:
  *
  *   Compress / decompress: memcpy the payload into a per-thread scratch buffer,
- *     producing FACTOR * payload bytes of output (default 1.33x, modelling a
- *     codec whose output/working set is larger than the input). The walking
- *     destination pointer touches fresh cache lines, so with scratch > L2 this
- *     generates real L3/DRAM traffic and evicts IOSTASH'd content from L3 the
- *     same way a real codec would.
+ *     producing FACTOR * payload bytes of output in one pass (default 1.33x,
+ *     modelling a codec whose output/working set is larger than the input).
  *
  *   CRC: run crc64 (isa-l crc64_ecma_refl) over the payload, the same scan a
  *     real data-integrity check performs.
@@ -76,7 +73,6 @@ struct sim_compress_state {
 	double		factor;
 	void		*scratch;
 	size_t		scratch_len;
-	size_t		scratch_off;	/* walking destination pointer */
 	uint64_t	crc_sink;	/* keeps crc results live, defeats DCE */
 };
 
@@ -125,7 +121,6 @@ sim_compress_init_once(void)
 		SPDK_WARNLOG("sim_compress: scratch alloc failed; compress sim disabled\n");
 		g_sim_compress.scratch_len = 0;
 	}
-	g_sim_compress.scratch_off = 0;
 
 	SPDK_NOTICELOG("sim_compress: scratch=%zu KiB factor=%.3f "
 		       "compress_w=%d compress_r=%d crc_w=%d crc_r=%d\n",
@@ -135,17 +130,15 @@ sim_compress_init_once(void)
 }
 
 /*
- * memcpy the payload into a moving destination inside scratch, producing
- * factor * payload_len bytes of output (the payload is re-read cyclically to
- * reach the target size when factor > 1). Walking the destination touches
- * fresh cache lines, so with scratch > L2 this generates real L3/DRAM traffic
- * and evicts IOSTASH'd content from L3, matching a real codec's footprint.
- * Returns the number of bytes written.
+ * memcpy the payload into scratch, producing factor * payload_len bytes of
+ * output in one pass (the payload is re-read cyclically to reach the target
+ * size when factor > 1). The destination wraps within scratch only as an
+ * overflow guard. Returns the number of bytes written.
  */
 static inline size_t
 sim_compress_expand(struct iovec *iov, int iovcnt)
 {
-	size_t total_in = 0, total_out, written = 0, pos = 0;
+	size_t total_in = 0, total_out, written = 0, pos = 0, dst = 0;
 	int i;
 
 	if (g_sim_compress.scratch == NULL) {
@@ -173,13 +166,13 @@ sim_compress_expand(struct iovec *iov, int iovcnt)
 		}
 		src = (const char *)iov[i].iov_base + pos;
 		seg_left = iov[i].iov_len - pos;
-		avail = g_sim_compress.scratch_len - g_sim_compress.scratch_off;
+		avail = g_sim_compress.scratch_len - dst;
 		n = spdk_min(seg_left, avail);
 		n = spdk_min(n, total_out - written);
-		memcpy((char *)g_sim_compress.scratch + g_sim_compress.scratch_off, src, n);
-		g_sim_compress.scratch_off += n;
-		if (g_sim_compress.scratch_off >= g_sim_compress.scratch_len) {
-			g_sim_compress.scratch_off = 0;
+		memcpy((char *)g_sim_compress.scratch + dst, src, n);
+		dst += n;
+		if (dst >= g_sim_compress.scratch_len) {
+			dst = 0;
 		}
 		pos += n;
 		written += n;

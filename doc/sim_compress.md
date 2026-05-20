@@ -18,11 +18,9 @@ read_cmd:   bdev complete  →  decompress 扩张  →  CRC 校验
 
 两类工作：
 
-- **压缩 / 解压**：把 payload memcpy 进 per-thread scratch，输出 `factor × L`
-  字节（默认 1.33 倍，模拟 codec 的输出 / 工作集大于输入）。目标字节数 > L
-  时循环重读 payload 凑够。**目的地指针在 scratch 上移动走**，每次都打到新
-  cache line / DRAM 行；scratch 默认 4 MiB（大于典型 L2），所以会真正消耗
-  L3 / 内存带宽，把 IOSTASH 写进 L3 的内容冲掉 —— 这正是要测的内存子系统压力。
+- **压缩 / 解压**：把 payload memcpy 进 per-thread scratch，一轮跑完输出
+  `factor × L` 字节（默认 1.33 倍，模拟 codec 的输出 / 工作集大于输入）。
+  目标字节数 > L 时循环重读 payload 凑够。scratch 仅作 memcpy 目标缓冲。
 - **CRC**：对 payload 跑 crc64（isa-l `crc64_ecma_refl`），和真实数据完整性
   校验一样的全量扫描。
 
@@ -44,20 +42,16 @@ read_cmd:   bdev complete  →  decompress 扩张  →  CRC 校验
 `FACTOR` 控制压缩阶段的内存搬运量：1.33 表示每个 I/O 多搬 33% 的数据。想
 让压缩延时更大就调高（如 `2.0`），`< 1.0` 会被夹到 1.0（至少把 payload 读一遍）。
 
-scratch 默认 4 MiB 够冲掉典型 L2。要冲掉 LLC（典型 32–64 MiB）建议设到
-`65536`（64 MiB）：
-
-```bash
-export SPDK_SIM_SCRATCH_KB=65536
-```
+scratch 只是压缩阶段的 memcpy 目标缓冲，够装下 `factor × 单次最大 I/O` 即可。
+默认 4 MiB 能覆盖到约 3 MiB 的 I/O；用更大 block 时按需调大。
 
 编译期开关：`lib/nvmf/ctrlr_bdev.c` 顶部 `#define SPDK_SIM_COMPRESS 1`。
 关掉传 `-DSPDK_SIM_COMPRESS=0` 给 make，整段仿真代码不编入二进制。
 
-nvmf_tgt 启动时会打一行 NOTICELOG，确认五个值的当前生效：
+nvmf_tgt 第一个 I/O 进来时会打一行 NOTICELOG，确认当前生效的开关与因子：
 
 ```
-[...] sim_compress: enabled scratch=4096 KiB compress_w_us=200 compress_r_us=200 crc_w_us=50 crc_r_us=50
+[...] sim_compress: scratch=4096 KiB factor=1.330 compress_w=1 compress_r=1 crc_w=1 crc_r=1
 ```
 
 ---
@@ -208,14 +202,13 @@ Client 跑 SPDK 自带 perf 当 initiator，指向 server 的某个 listener IP�
 |---|---|---|---|
 | baseline | 0 / 0 | 0 / 0 | 干净路径，IOSTASH 仍生效 |
 | crc      | 0 / 0 | 1 / 1 | 仅 CRC：对 payload 跑 crc64 全量扫描 |
-| comp     | 1 / 1 | 0 / 0 | 仅压缩：memcpy 出 1.33×payload，冲 L3 |
+| comp     | 1 / 1 | 0 / 0 | 仅压缩：memcpy 出 1.33×payload |
 | both     | 1 / 1 | 1 / 1 | 实际部署形态 |
 
 延时不是配出来的，是按 block size 算出来的：压缩搬 `factor × block`，crc64
 扫一遍 `block`。**所以 block 越大，combo 与 baseline 的 delta 越明显**；4 KiB
 小块上每个 I/O 的额外工作不到 1 µs，会被网络往返淹没，要看效果用大 block
-（如 1 MiB）。想放大压缩开销调 `SPDK_SIM_COMPRESS_FACTOR`，想冲 LLC 调
-`SPDK_SIM_SCRATCH_KB=65536`。
+（如 1 MiB）。想放大压缩开销调 `SPDK_SIM_COMPRESS_FACTOR`。
 
 ---
 
@@ -331,10 +324,10 @@ baseline 最快，crc / comp 各叠一档延时，both 最大 —— 延时是 b
 
 baseline → comp 横向看：
 
-- IOPS 跌（CPU 被 memcpy 吃掉）
-- 网络带宽**线性**跟着 IOPS 跌（IOPS × 4K = MB/s）
-- 内存带宽**飙升**（baseline 18 GB/s → both 82 GB/s，是 IOSTASH 失效后 DMA 写得绕道 DRAM 的直接证据）
-- LLC miss% **上升**（scratch 走多了把 L3 内容冲掉）
+- IOPS 跌（CPU 被 memcpy + crc64 吃掉）
+- 网络带宽**线性**跟着 IOPS 跌（IOPS × block = MB/s）
+- 内存带宽**上升**（压缩阶段每个 I/O 多搬 `factor × payload`，crc64 全量扫一遍）
+- LLC miss% 可能上升（取决于 block / scratch 与缓存的相对大小）
 
 ## Server / Client 分离用法
 
@@ -412,15 +405,14 @@ mem_mbps / llc_miss_pct，复制 summarize 函数改一下 `_mread` 取 server l
 # 实现要点
 
 - **压缩 / 解压 = 定额 memcpy**：`sim_compress_expand(iov, iovcnt)` 把 payload
-  拷进 scratch，输出 `factor × L` 字节（`L` = 本次 I/O 总长）。目的地指针在
-  scratch 上**移动走**，每次都打到新 cache line；目标字节数 > L 时循环重读
-  payload 凑够。工作量正比于数据量，不是按时间自旋。
+  拷进 scratch，一轮跑完输出 `factor × L` 字节（`L` = 本次 I/O 总长）；目标
+  字节数 > L 时循环重读 payload 凑够。工作量正比于数据量，不是按时间自旋。
 - **CRC = 真 crc64**：`sim_crc64_iov(iov, iovcnt)` 对 payload 跑 isa-l
   `crc64_ecma_refl`（`#ifdef SPDK_CONFIG_ISAL`），跨 iov 段链式累加。结果异或
   进 `crc_sink` 防止编译器把计算优化掉。
-- **Scratch 大小**：默认 4 MiB（`SPDK_SIM_SCRATCH_KB=4096`），大于任何
-  现代 CPU 单核 L2。要超过 LLC 强制 DRAM 流量，设到 `65536` (64 MiB)。
-  per-reactor-thread 各自一块，`spdk_zmalloc` 分配 DMA-able 内存。
+- **Scratch**：压缩 memcpy 的目标缓冲，默认 4 MiB（`SPDK_SIM_SCRATCH_KB=4096`），
+  够装 `factor × 单次最大 I/O`。per-reactor-thread 各自一块，`spdk_zmalloc`
+  分配 DMA-able 内存。
 - **不修改 payload**：scratch 是写入目标，`req->iov` 原数据不动，提交到
   底层 bdev 的依然是原指针。
 - **只挂 bdev 路径**：admin cmd、zcopy、compare-and-write、fused 等不动。
@@ -432,7 +424,7 @@ mem_mbps / llc_miss_pct，复制 summarize 函数改一下 `_mread` 取 server l
 ./test/unit/lib/nvmf/ctrlr_bdev.c/ctrlr_bdev_ut
 ```
 
-应当报 11/11 tests, 164/164 asserts 全过（含 `test_sim_compress_expand`
+应当报 11/11 tests, 163/163 asserts 全过（含 `test_sim_compress_expand`
 验证 `factor × L` 字节数 + 循环重读，`test_sim_crc64_iov` 验证 crc64 全量扫描）。
 
 ---
@@ -483,5 +475,5 @@ OrbStack VM 上：
   LLC-loads` 报 `<not supported>`
 
 延时和带宽都跟 IOPS 同比走，证明补丁逻辑通了。**真正的内存带宽 / DDIO /
-LLC 信号要在物理 Intel/AMD 主机上跑才能看到** —— 那里 baseline 和 comp
-的内存带宽差距应在 5–10× 之间（IOSTASH 失效的硬证据）。
+LLC 信号要在物理 Intel/AMD 主机上跑才能看到** —— 开压缩后每个 I/O 多搬
+`factor × payload`，开 CRC 后多扫一遍 payload，server 端内存带宽应随之上升。

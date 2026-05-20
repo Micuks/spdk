@@ -943,7 +943,6 @@ test_sim_compress_expand(void)
 	memset(&g_sim_compress, 0, sizeof(g_sim_compress));
 	g_sim_compress.scratch = scratch;
 	g_sim_compress.scratch_len = 64 * 1024;
-	g_sim_compress.scratch_off = 0;
 	g_sim_compress.factor = 1.5;
 
 	iov.iov_base = payload;
@@ -953,7 +952,6 @@ test_sim_compress_expand(void)
 
 	/* factor 1.5 over 1000 bytes => 1500 bytes of memcpy output work */
 	CU_ASSERT(written == 1500);
-	CU_ASSERT(g_sim_compress.scratch_off == 1500);
 	/* first L bytes are the payload verbatim */
 	CU_ASSERT(memcmp(scratch, payload, sizeof(payload)) == 0);
 	/* the extra 0.5L bytes re-read the payload cyclically */
